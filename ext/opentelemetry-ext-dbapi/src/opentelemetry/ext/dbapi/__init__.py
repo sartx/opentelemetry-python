@@ -46,9 +46,10 @@ import typing
 
 import wrapt
 
+from opentelemetry import trace as trace_api
 from opentelemetry.ext.dbapi.version import __version__
 from opentelemetry.instrumentation.utils import unwrap
-from opentelemetry.trace import SpanKind, Tracer, TracerProvider, get_tracer
+from opentelemetry.trace import SpanKind, TracerProvider, get_tracer
 from opentelemetry.trace.status import Status, StatusCanonicalCode
 
 logger = logging.getLogger(__name__)
@@ -76,24 +77,27 @@ def trace_integration(
             tracer_provider: The :class:`opentelemetry.trace.TracerProvider` to
                 use. If ommited the current configured one is used.
     """
-    tracer = get_tracer(__name__, __version__, tracer_provider)
     wrap_connect(
-        tracer,
+        __name__,
         connect_module,
         connect_method_name,
         database_component,
         database_type,
         connection_attributes,
+        version=__version__,
+        tracer_provider=tracer_provider,
     )
 
 
 def wrap_connect(
-    tracer: Tracer,
+    name: str,
     connect_module: typing.Callable[..., typing.Any],
     connect_method_name: str,
     database_component: str,
     database_type: str = "",
     connection_attributes: typing.Dict = None,
+    version: str = "",
+    tracer_provider: typing.Optional[TracerProvider] = None,
 ):
     """Integrate with DB API library.
         https://www.python.org/dev/peps/pep-0249/
@@ -117,10 +121,12 @@ def wrap_connect(
         kwargs: typing.Dict[typing.Any, typing.Any],
     ):
         db_integration = DatabaseApiIntegration(
-            tracer,
+            name,
             database_component,
             database_type=database_type,
             connection_attributes=connection_attributes,
+            version=version,
+            tracer_provider=tracer_provider,
         )
         return db_integration.wrapped_connection(wrapped, args, kwargs)
 
@@ -146,11 +152,13 @@ def unwrap_connect(
 
 
 def instrument_connection(
-    tracer,
+    name: str,
     connection,
     database_component: str,
     database_type: str = "",
     connection_attributes: typing.Dict = None,
+    version: str = "",
+    tracer_provider: typing.Optional[TracerProvider] = None,
 ):
     """Enable instrumentation in a database connection.
 
@@ -167,10 +175,12 @@ def instrument_connection(
         An instrumented connection.
     """
     db_integration = DatabaseApiIntegration(
-        tracer,
+        name,
         database_component,
         database_type,
         connection_attributes=connection_attributes,
+        version=version,
+        tracer_provider=tracer_provider,
     )
     db_integration.get_connection_attributes(connection)
     return get_traced_connection_proxy(connection, db_integration)
@@ -195,10 +205,12 @@ def uninstrument_connection(connection):
 class DatabaseApiIntegration:
     def __init__(
         self,
-        tracer: Tracer,
+        name: str,
         database_component: str,
         database_type: str = "sql",
         connection_attributes=None,
+        version: str = "",
+        tracer_provider: typing.Optional[TracerProvider] = None,
     ):
         self.connection_attributes = connection_attributes
         if self.connection_attributes is None:
@@ -208,13 +220,22 @@ class DatabaseApiIntegration:
                 "host": "host",
                 "user": "user",
             }
-        self.tracer = tracer
+        self._name = name
+        self._version = version
+        self._tracer_provider = tracer_provider
         self.database_component = database_component
         self.database_type = database_type
         self.connection_props = {}
         self.span_attributes = {}
         self.name = ""
         self.database = ""
+
+    def get_tracer(self):
+        return get_tracer(
+            self._name,
+            instrumenting_library_version=self._version,
+            tracer_provider=self._tracer_provider,
+        )
 
     def wrapped_connection(
         self,
@@ -280,6 +301,26 @@ class TracedCursor:
     def __init__(self, db_api_integration: DatabaseApiIntegration):
         self._db_api_integration = db_api_integration
 
+    def _populate_span(
+        self, span: trace_api.Span, *args: typing.Tuple[typing.Any, typing.Any]
+    ):
+        statement = args[0] if args else ""
+        span.set_attribute(
+            "component", self._db_api_integration.database_component
+        )
+        span.set_attribute("db.type", self._db_api_integration.database_type)
+        span.set_attribute("db.instance", self._db_api_integration.database)
+        span.set_attribute("db.statement", statement)
+
+        for (
+            attribute_key,
+            attribute_value,
+        ) in self._db_api_integration.span_attributes.items():
+            span.set_attribute(attribute_key, attribute_value)
+
+        if len(args) > 1:
+            span.set_attribute("db.statement.parameters", str(args[1]))
+
     def traced_execution(
         self,
         query_method: typing.Callable[..., typing.Any],
@@ -287,30 +328,10 @@ class TracedCursor:
         **kwargs: typing.Dict[typing.Any, typing.Any]
     ):
 
-        statement = args[0] if args else ""
-        with self._db_api_integration.tracer.start_as_current_span(
+        with self._db_api_integration.get_tracer().start_as_current_span(
             self._db_api_integration.name, kind=SpanKind.CLIENT
         ) as span:
-            span.set_attribute(
-                "component", self._db_api_integration.database_component
-            )
-            span.set_attribute(
-                "db.type", self._db_api_integration.database_type
-            )
-            span.set_attribute(
-                "db.instance", self._db_api_integration.database
-            )
-            span.set_attribute("db.statement", statement)
-
-            for (
-                attribute_key,
-                attribute_value,
-            ) in self._db_api_integration.span_attributes.items():
-                span.set_attribute(attribute_key, attribute_value)
-
-            if len(args) > 1:
-                span.set_attribute("db.statement.parameters", str(args[1]))
-
+            self._populate_span(span, *args)
             try:
                 result = query_method(*args, **kwargs)
                 span.set_status(Status(StatusCanonicalCode.OK))
@@ -322,6 +343,7 @@ class TracedCursor:
 
 def get_traced_cursor_proxy(cursor, db_api_integration, *args, **kwargs):
     _traced_cursor = TracedCursor(db_api_integration)
+
     # pylint: disable=abstract-method
     class TracedCursorProxy(wrapt.ObjectProxy):
 

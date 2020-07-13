@@ -1,11 +1,10 @@
-import asyncio
-import functools
 import typing
 
 import wrapt
 from aiopg.utils import _ContextManager, _PoolAcquireContextManager
 
-from opentelemetry.trace import SpanKind, Tracer
+from opentelemetry.ext.dbapi import DatabaseApiIntegration, TracedCursor
+from opentelemetry.trace import SpanKind
 from opentelemetry.trace.status import Status, StatusCanonicalCode
 
 
@@ -14,54 +13,22 @@ class AsyncProxyObject(wrapt.ObjectProxy):
     def __aiter__(self):
         return self.__wrapped__.__aiter__()
 
-    @asyncio.coroutine
-    def __anext__(self):
-        result = yield from self.__wrapped__.__anext__()
+    async def __anext__(self):
+        result = await self.__wrapped__.__anext__()
         return result
 
-    @asyncio.coroutine
-    def __aenter__(self):
-        result = yield from self.__wrapped__.__aenter__()
-        return result
+    async def __aenter__(self):
+        return await self.__wrapped__.__aenter__()
 
-    @asyncio.coroutine
-    def __aexit__(self, exc_type, exc_val, exc_tb):
-        result = yield from self.__wrapped__.__aexit__(
-            exc_type, exc_val, exc_tb
-        )
-        return result
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return await self.__wrapped__.__aexit__(exc_type, exc_val, exc_tb)
 
     def __await__(self):
-        result = yield from self.__wrapped__.__await__()
-        return result
+        return self.__wrapped__.__await__()
 
 
-class AiopgIntegration:
-    def __init__(
-        self,
-        tracer: Tracer,
-        database_component: str,
-        database_type: str = "sql",
-        connection_attributes=None,
-    ):
-        self.connection_attributes = connection_attributes
-        if self.connection_attributes is None:
-            self.connection_attributes = {
-                "database": "database",
-                "port": "port",
-                "host": "host",
-                "user": "user",
-            }
-        self.tracer = tracer
-        self.database_component = database_component
-        self.database_type = database_type
-        self.connection_props = {}
-        self.span_attributes = {}
-        self.name = ""
-        self.database = ""
-
-    @asyncio.coroutine
-    def wrapped_connection(
+class AiopgIntegration(DatabaseApiIntegration):
+    async def wrapped_connection(
         self,
         connect_method: typing.Callable[..., typing.Any],
         args: typing.Tuple[typing.Any, typing.Any],
@@ -69,45 +36,17 @@ class AiopgIntegration:
     ):
         """Add object proxy to connection object.
         """
-        connection = yield from connect_method(*args, **kwargs)
-        self.get_connection_attributes(connection)
+        connection = await connect_method(*args, **kwargs)
+        # pylint: disable=protected-access
+        self.get_connection_attributes(connection._conn)
         return get_traced_connection_proxy(connection, self)
 
-    @asyncio.coroutine
-    def wrapped_pool(self, create_pool_method, args, kwargs):
-        pool = yield from create_pool_method(*args, **kwargs)
-        self.get_connection_attributes(pool)
+    async def wrapped_pool(self, create_pool_method, args, kwargs):
+        pool = await create_pool_method(*args, **kwargs)
+        async with pool.acquire() as connection:
+            # pylint: disable=protected-access
+            self.get_connection_attributes(connection._conn)
         return get_traced_pool_proxy(pool, self)
-
-    def get_connection_attributes(self, connection):
-        # Populate span fields using connection
-        for key, value in self.connection_attributes.items():
-            # Allow attributes nested in connection object
-            attribute = functools.reduce(
-                lambda attribute, attribute_value: getattr(
-                    attribute, attribute_value, None
-                ),
-                value.split("."),
-                connection,
-            )
-            if attribute:
-                self.connection_props[key] = attribute
-        self.name = self.database_component
-        self.database = self.connection_props.get("database", "")
-        if self.database:
-            # PyMySQL encodes names with utf-8
-            if hasattr(self.database, "decode"):
-                self.database = self.database.decode(errors="ignore")
-            self.name += "." + self.database
-        user = self.connection_props.get("user")
-        if user is not None:
-            self.span_attributes["db.user"] = str(user)
-        host = self.connection_props.get("host")
-        if host is not None:
-            self.span_attributes["net.peer.name"] = host
-        port = self.connection_props.get("port")
-        if port is not None:
-            self.span_attributes["net.peer.port"] = port
 
 
 def get_traced_connection_proxy(
@@ -123,10 +62,9 @@ def get_traced_connection_proxy(
             coro = self._cursor(*args, **kwargs)
             return _ContextManager(coro)
 
-        @asyncio.coroutine
-        def _cursor(self, *args, **kwargs):
+        async def _cursor(self, *args, **kwargs):
             # pylint: disable=protected-access
-            cursor = yield from self.__wrapped__._cursor(*args, **kwargs)
+            cursor = await self.__wrapped__._cursor(*args, **kwargs)
             return get_traced_cursor_proxy(cursor, db_api_integration)
 
     return TracedConnectionProxy(connection, *args, **kwargs)
@@ -144,10 +82,9 @@ def get_traced_pool_proxy(pool, db_api_integration, *args, **kwargs):
             coro = self._acquire()
             return _PoolAcquireContextManager(coro, self)
 
-        @asyncio.coroutine
-        def _acquire(self):
+        async def _acquire(self):
             # pylint: disable=protected-access
-            connection = yield from self.__wrapped__._acquire()
+            connection = await self.__wrapped__._acquire()
             return get_traced_connection_proxy(
                 connection, db_api_integration, *args, **kwargs
             )
@@ -155,44 +92,20 @@ def get_traced_pool_proxy(pool, db_api_integration, *args, **kwargs):
     return TracedPoolProxy(pool, *args, **kwargs)
 
 
-class AsyncTracedCursor:
-    def __init__(self, db_api_integration: AiopgIntegration):
-        self._db_api_integration = db_api_integration
-
-    @asyncio.coroutine
-    def traced_execution(
+class AsyncTracedCursor(TracedCursor):
+    async def traced_execution(
         self,
         query_method: typing.Callable[..., typing.Any],
         *args: typing.Tuple[typing.Any, typing.Any],
         **kwargs: typing.Dict[typing.Any, typing.Any]
     ):
 
-        statement = args[0] if args else ""
-        with self._db_api_integration.tracer.start_as_current_span(
+        with self._db_api_integration.get_tracer().start_as_current_span(
             self._db_api_integration.name, kind=SpanKind.CLIENT
         ) as span:
-            span.set_attribute(
-                "component", self._db_api_integration.database_component
-            )
-            span.set_attribute(
-                "db.type", self._db_api_integration.database_type
-            )
-            span.set_attribute(
-                "db.instance", self._db_api_integration.database
-            )
-            span.set_attribute("db.statement", statement)
-
-            for (
-                attribute_key,
-                attribute_value,
-            ) in self._db_api_integration.span_attributes.items():
-                span.set_attribute(attribute_key, attribute_value)
-
-            if len(args) > 1:
-                span.set_attribute("db.statement.parameters", str(args[1]))
-
+            self._populate_span(span, *args)
             try:
-                result = yield from query_method(*args, **kwargs)
+                result = await query_method(*args, **kwargs)
                 span.set_status(Status(StatusCanonicalCode.OK))
                 return result
             except Exception as ex:  # pylint: disable=broad-except
@@ -210,23 +123,20 @@ def get_traced_cursor_proxy(cursor, db_api_integration, *args, **kwargs):
         def __init__(self, cursor, *args, **kwargs):
             super().__init__(cursor)
 
-        @asyncio.coroutine
-        def execute(self, *args, **kwargs):
-            result = yield from _traced_cursor.traced_execution(
+        async def execute(self, *args, **kwargs):
+            result = await _traced_cursor.traced_execution(
                 self.__wrapped__.execute, *args, **kwargs
             )
             return result
 
-        @asyncio.coroutine
-        def executemany(self, *args, **kwargs):
-            result = yield from _traced_cursor.traced_execution(
+        async def executemany(self, *args, **kwargs):
+            result = await _traced_cursor.traced_execution(
                 self.__wrapped__.executemany, *args, **kwargs
             )
             return result
 
-        @asyncio.coroutine
-        def callproc(self, *args, **kwargs):
-            result = yield from _traced_cursor.traced_execution(
+        async def callproc(self, *args, **kwargs):
+            result = await _traced_cursor.traced_execution(
                 self.__wrapped__.callproc, *args, **kwargs
             )
             return result

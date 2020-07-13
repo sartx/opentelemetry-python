@@ -24,11 +24,8 @@ Usage
 .. code-block:: python
 
     import aiopg
-    from opentelemetry import trace
     from opentelemetry.ext.aiopg import AiopgInstrumentor
     from opentelemetry.sdk.trace import TracerProvider
-
-    trace.set_tracer_provider(TracerProvider())
 
     AiopgInstrumentor().instrument()
 
@@ -49,12 +46,9 @@ API
 ---
 """
 
-import aiopg
-
 from opentelemetry.ext.aiopg import wrappers
 from opentelemetry.ext.aiopg.version import __version__
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
-from opentelemetry.trace import get_tracer
 
 
 class AiopgInstrumentor(BaseInstrumentor):
@@ -75,30 +69,28 @@ class AiopgInstrumentor(BaseInstrumentor):
 
         tracer_provider = kwargs.get("tracer_provider")
 
-        tracer = get_tracer(__name__, __version__, tracer_provider)
-
         wrappers.wrap_connect(
-            tracer,
-            aiopg,
-            "connect",
+            __name__,
             self._DATABASE_COMPONENT,
             self._DATABASE_TYPE,
             self._CONNECTION_ATTRIBUTES,
+            version=__version__,
+            tracer_provider=tracer_provider,
         )
 
         wrappers.wrap_create_pool(
-            tracer,
-            aiopg,
-            "create_pool",
+            __name__,
             self._DATABASE_COMPONENT,
             self._DATABASE_TYPE,
             self._CONNECTION_ATTRIBUTES,
+            version=__version__,
+            tracer_provider=tracer_provider,
         )
 
     def _uninstrument(self, **kwargs):
         """"Disable aiopg instrumentation"""
-        wrappers.unwrap_connect(aiopg, "connect")
-        wrappers.unwrap_create_pool(aiopg, "create_pool")
+        wrappers.unwrap_connect()
+        wrappers.unwrap_create_pool()
 
     # pylint:disable=no-self-use
     def instrument_connection(self, connection):
@@ -110,10 +102,8 @@ class AiopgInstrumentor(BaseInstrumentor):
         Returns:
             An instrumented connection.
         """
-        tracer = get_tracer(__name__, __version__)
-
         return wrappers.instrument_connection(
-            tracer,
+            __name__,
             connection,
             self._DATABASE_COMPONENT,
             self._DATABASE_TYPE,
