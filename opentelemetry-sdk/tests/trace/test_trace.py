@@ -344,6 +344,7 @@ class TestSpanCreation(unittest.TestCase):
             trace_id=0x000000000000000000000000DEADBEEF,
             span_id=0x00000000DEADBEF0,
             is_remote=False,
+            trace_flags=trace_api.TraceFlags(trace_api.TraceFlags.SAMPLED),
         )
 
         self.assertEqual(trace_api.get_current_span(), trace_api.INVALID_SPAN)
@@ -801,18 +802,23 @@ class TestSpan(unittest.TestCase):
             .start_as_current_span("root")
         )
 
-    def test_record_error(self):
+    def test_record_exception(self):
         span = trace.Span("name", mock.Mock(spec=trace_api.SpanContext))
         try:
             raise ValueError("invalid")
         except ValueError as err:
-            span.record_error(err)
-        error_event = span.events[0]
-        self.assertEqual("error", error_event.name)
-        self.assertEqual("invalid", error_event.attributes["error.message"])
-        self.assertEqual("ValueError", error_event.attributes["error.type"])
+            span.record_exception(err)
+        exception_event = span.events[0]
+        self.assertEqual("exception", exception_event.name)
+        self.assertEqual(
+            "invalid", exception_event.attributes["exception.message"]
+        )
+        self.assertEqual(
+            "ValueError", exception_event.attributes["exception.type"]
+        )
         self.assertIn(
-            "ValueError: invalid", error_event.attributes["error.stack"]
+            "ValueError: invalid",
+            exception_event.attributes["exception.stacktrace"],
         )
 
 
